@@ -1,0 +1,18 @@
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Session and output data
+sessions/
+outputs/
+
+# Config with secrets
+config.json
+
+# IDE
+.vscode/
+.idea/

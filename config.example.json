@@ -1,0 +1,16 @@
+{
+  "telegram": {
+    "bot_token": "YOUR_BOT_TOKEN",
+    "authorized_user_id": 0
+  },
+  "default_project": null,
+  "projects": {},
+  "claude_code": {
+    "executable": "claude",
+    "default_approval_mode": "safe"
+  },
+  "sessions": {
+    "storage_path": "./sessions"
+  },
+  "outputs_path": "./outputs"
+}
