@@ -33,12 +33,14 @@ class MessageRouter:
         self,
         text: str,
         image_paths: Optional[list[str]] = None,
+        last_project: Optional[str] = None,
     ) -> ParsedMessage:
         """Parse a message and resolve the target project.
 
         Args:
             text: Message text, optionally with #project prefix
             image_paths: Paths to downloaded images
+            last_project: Last-used project name for fallback
 
         Returns:
             ParsedMessage with resolved project and task
@@ -55,8 +57,12 @@ class MessageRouter:
             project_name = match.group(1).lower()
             task = match.group(2).strip()
         else:
+            # No explicit project - try last_project fallback
             project_name = None
             task = text.strip()
+
+            if last_project and last_project in self.config.projects:
+                project_name = last_project
 
         # Resolve project (may raise ValueError)
         resolved_name, project_config = self.config.get_project(project_name)

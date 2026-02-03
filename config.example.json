@@ -12,5 +12,8 @@
   "sessions": {
     "storage_path": "./sessions"
   },
-  "outputs_path": "./outputs"
+  "outputs_path": "./outputs",
+  "scheduled_tasks": {
+    "check_interval": 30
+  }
 }

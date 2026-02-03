@@ -57,3 +57,36 @@ class SessionManager:
     def list_sessions(self) -> dict[str, str]:
         """Get all active sessions."""
         return dict(self._sessions)
+
+    def _chat_prefs_file(self, chat_id: int) -> Path:
+        """Get path to chat preferences file."""
+        return self.storage_path / f"chat_{chat_id}_prefs.json"
+
+    def get_last_project(self, chat_id: int) -> Optional[str]:
+        """Get the last-used project for a chat."""
+        prefs_file = self._chat_prefs_file(chat_id)
+        if not prefs_file.exists():
+            return None
+        try:
+            with open(prefs_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("last_project")
+        except (json.JSONDecodeError, IOError):
+            return None
+
+    def set_last_project(self, chat_id: int, project_name: str) -> None:
+        """Store the last-used project for a chat."""
+        prefs_file = self._chat_prefs_file(chat_id)
+
+        # Load existing prefs or start fresh
+        data = {}
+        if prefs_file.exists():
+            try:
+                with open(prefs_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        data["last_project"] = project_name
+        with open(prefs_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)

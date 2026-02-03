@@ -15,12 +15,15 @@ from telegram.ext import (
     filters,
 )
 
+from datetime import datetime
+
 from .approval_handler import ApprovalHandler
 from .claude_interface import ClaudeInterface, SAFE_TOOLS
 from .config import Config
 from .message_router import MessageRouter, ParsedMessage
 from .output_processor import OutputProcessor
 from .queue_manager import QueuedTask, QueueManager
+from .scheduled_task_manager import ScheduledTaskManager, ScheduledTask
 from .session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,7 @@ class TelegramBot:
         self.output = OutputProcessor(config.outputs_path)
         self.queue = QueueManager()
         self.approvals = ApprovalHandler()
+        self.scheduler = ScheduledTaskManager(config.sessions.storage_path)
         self.app: Application = None
 
     async def start(self) -> None:
@@ -57,6 +61,10 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("skip", self._cmd_skip))
         self.app.add_handler(CommandHandler("addproject", self._cmd_addproject))
         self.app.add_handler(CommandHandler("removeproject", self._cmd_removeproject))
+        self.app.add_handler(CommandHandler("project", self._cmd_project))
+        self.app.add_handler(CommandHandler("schedule", self._cmd_schedule))
+        self.app.add_handler(CommandHandler("tasks", self._cmd_tasks))
+        self.app.add_handler(CommandHandler("deletetask", self._cmd_deletetask))
 
         # Callback handler for approval buttons
         self.app.add_handler(CallbackQueryHandler(self.approvals.handle_callback))
@@ -74,8 +82,12 @@ class TelegramBot:
         await self.app.start()
         await self.app.updater.start_polling()
 
+        # Start the scheduled task manager
+        await self.scheduler.start(self._execute_scheduled_task)
+
     async def stop(self) -> None:
         """Stop the bot."""
+        await self.scheduler.stop()
         if self.app:
             await self.app.updater.stop()
             await self.app.stop()
@@ -120,6 +132,9 @@ class TelegramBot:
         default = self.config.default_project or "(not set)"
         mode = self.config.claude_code.default_approval_mode
 
+        chat_id = update.message.chat_id
+        current_project = self.sessions.get_last_project(chat_id) or "(none)"
+
         await update.message.reply_text(
             "Usage:\n"
             "  Send a message to execute a task\n"
@@ -127,10 +142,16 @@ class TelegramBot:
             "  Send images with caption for visual tasks\n\n"
             "Commands:\n"
             "  /projects - List configured projects\n"
+            "  /project [name] - View/set current project\n"
             "  /new [#project] - Reset session, start fresh\n"
             "  /skip - Skip current errored task\n"
             "  /addproject name path - Add project\n"
             "  /removeproject name - Remove project\n\n"
+            "Scheduled tasks:\n"
+            "  /schedule <type> <time> #project <prompt>\n"
+            "  /tasks - List scheduled tasks\n"
+            "  /deletetask <id> - Delete a task\n\n"
+            f"Current project: #{current_project}\n"
             f"Default project: {default}\n"
             f"Default approval mode: {mode}\n\n"
             "Approval modes:\n"
@@ -268,6 +289,257 @@ class TelegramBot:
         else:
             await update.message.reply_text(f"Project #{name} not found")
 
+    async def _cmd_project(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /project command - view or set current project."""
+        if not self._is_authorized(update):
+            return
+
+        chat_id = update.message.chat_id
+        args = context.args or []
+
+        if not args:
+            # Show current project
+            last_project = self.sessions.get_last_project(chat_id)
+            if last_project:
+                await update.message.reply_text(f"Current project: #{last_project}")
+            else:
+                await update.message.reply_text(
+                    "No current project set.\n"
+                    "Use /project <name> to set one, or prefix a message with #projectname."
+                )
+            return
+
+        # Set current project
+        project_name = args[0].lower().lstrip("#")
+
+        if project_name not in self.config.projects:
+            await update.message.reply_text(
+                f"Project #{project_name} not found.\n"
+                "Use /projects to see available projects."
+            )
+            return
+
+        self.sessions.set_last_project(chat_id, project_name)
+        await update.message.reply_text(f"Current project set to #{project_name}")
+
+    async def _cmd_schedule(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /schedule command - create a scheduled task."""
+        if not self._is_authorized(update):
+            return
+
+        args = context.args or []
+        if len(args) < 3:
+            await update.message.reply_text(
+                "Usage:\n"
+                "  /schedule once <datetime> #project <prompt>\n"
+                "  /schedule daily <HH:MM> #project <prompt>\n"
+                "  /schedule weekly <day> <HH:MM> #project <prompt>\n\n"
+                "Examples:\n"
+                "  /schedule once 2024-01-15T10:00 #webapp run tests\n"
+                "  /schedule daily 09:00 #api health check\n"
+                "  /schedule weekly 0 09:00 #scripts backup  (0=Monday)"
+            )
+            return
+
+        schedule_type = args[0].lower()
+        if schedule_type not in ("once", "daily", "weekly"):
+            await update.message.reply_text(
+                f"Invalid schedule type '{schedule_type}'. Use: once, daily, weekly"
+            )
+            return
+
+        try:
+            if schedule_type == "once":
+                # /schedule once <datetime> #project prompt
+                run_time = datetime.fromisoformat(args[1])
+                rest = " ".join(args[2:])
+                time_of_day = ""
+                day_of_week = None
+
+            elif schedule_type == "daily":
+                # /schedule daily <HH:MM> #project prompt
+                time_of_day = args[1]
+                # Validate time format
+                hour, minute = map(int, time_of_day.split(":"))
+                run_time = datetime.now().replace(
+                    hour=hour, minute=minute, second=0, microsecond=0
+                )
+                if run_time <= datetime.now():
+                    from datetime import timedelta
+                    run_time += timedelta(days=1)
+                rest = " ".join(args[2:])
+                day_of_week = None
+
+            else:  # weekly
+                # /schedule weekly <day> <HH:MM> #project prompt
+                day_of_week = int(args[1])
+                if not 0 <= day_of_week <= 6:
+                    raise ValueError("Day must be 0-6 (Monday-Sunday)")
+                time_of_day = args[2]
+                hour, minute = map(int, time_of_day.split(":"))
+                # Calculate next occurrence
+                from datetime import timedelta
+                run_time = datetime.now().replace(
+                    hour=hour, minute=minute, second=0, microsecond=0
+                )
+                days_ahead = day_of_week - run_time.weekday()
+                if days_ahead <= 0:
+                    days_ahead += 7
+                run_time += timedelta(days=days_ahead)
+                rest = " ".join(args[3:])
+
+            # Parse #project and prompt from rest
+            if not rest.startswith("#"):
+                await update.message.reply_text(
+                    "Please specify a project with #projectname"
+                )
+                return
+
+            parts = rest.split(maxsplit=1)
+            project_name = parts[0][1:].lower()  # Remove #
+            prompt = parts[1] if len(parts) > 1 else ""
+
+            if not prompt:
+                await update.message.reply_text("Please provide a prompt to execute")
+                return
+
+            if project_name not in self.config.projects:
+                await update.message.reply_text(f"Project #{project_name} not found")
+                return
+
+            # Create the scheduled task
+            task = self.scheduler.create_task(
+                chat_id=update.message.chat_id,
+                project_name=project_name,
+                prompt=prompt,
+                schedule_type=schedule_type,
+                run_time=run_time,
+                time_of_day=time_of_day,
+                day_of_week=day_of_week,
+            )
+
+            await update.message.reply_text(
+                f"Scheduled task created (ID: {task.task_id})\n"
+                f"Type: {schedule_type}\n"
+                f"Project: #{project_name}\n"
+                f"Next run: {task.next_run}\n"
+                f"Prompt: {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
+            )
+
+        except (ValueError, IndexError) as e:
+            await update.message.reply_text(f"Error parsing schedule: {e}")
+
+    async def _cmd_tasks(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /tasks command - list scheduled tasks."""
+        if not self._is_authorized(update):
+            return
+
+        tasks = self.scheduler.list_tasks(chat_id=update.message.chat_id)
+
+        if not tasks:
+            await update.message.reply_text("No scheduled tasks.")
+            return
+
+        lines = ["Scheduled tasks:\n"]
+        for task in tasks:
+            status = "enabled" if task.enabled else "disabled"
+            day_str = ""
+            if task.schedule_type == "weekly" and task.day_of_week is not None:
+                days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                day_str = f" ({days[task.day_of_week]})"
+
+            lines.append(f"[{task.task_id}] {task.schedule_type}{day_str} - #{task.project_name}")
+            lines.append(f"  Next: {task.next_run}")
+            lines.append(f"  Prompt: {task.prompt[:40]}{'...' if len(task.prompt) > 40 else ''}")
+            lines.append(f"  Status: {status}")
+            lines.append("")
+
+        await update.message.reply_text("\n".join(lines))
+
+    async def _cmd_deletetask(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /deletetask command - delete a scheduled task."""
+        if not self._is_authorized(update):
+            return
+
+        args = context.args or []
+        if not args:
+            await update.message.reply_text("Usage: /deletetask <task_id>")
+            return
+
+        task_id = args[0]
+        if self.scheduler.delete_task(task_id):
+            await update.message.reply_text(f"Deleted scheduled task {task_id}")
+        else:
+            await update.message.reply_text(f"Task {task_id} not found")
+
+    async def _execute_scheduled_task(self, task: ScheduledTask) -> None:
+        """Execute a scheduled task - callback for ScheduledTaskManager."""
+        project_config = self.config.projects.get(task.project_name)
+        if not project_config:
+            logger.error(f"Scheduled task {task.task_id}: project {task.project_name} not found")
+            return
+
+        # Send notification that task is starting
+        await self.app.bot.send_message(
+            chat_id=task.chat_id,
+            text=f"⏰ Running scheduled task ({task.task_id})\n"
+                 f"Project: #{task.project_name}\n"
+                 f"Prompt: {task.prompt[:50]}{'...' if len(task.prompt) > 50 else ''}",
+        )
+
+        # Get existing session
+        session_id = self.sessions.get_session_id(task.project_name)
+
+        # Execute (simplified - no approval flow for scheduled tasks, uses safe mode)
+        result = await self.claude.execute(
+            prompt=task.prompt,
+            working_dir=project_config.path,
+            session_id=session_id,
+            approval_mode="safe",
+            allowed_tools=None,
+        )
+
+        # Save session ID
+        if result.session_id:
+            self.sessions.set_session_id(task.project_name, result.session_id)
+
+        # Process and send output
+        message_text, file_path = self.output.process(
+            output=result.output,
+            project_name=task.project_name,
+            success=result.success,
+            error=result.error,
+        )
+
+        await self.app.bot.send_message(
+            chat_id=task.chat_id,
+            text=f"⏰ Scheduled task result ({task.task_id}):\n\n{message_text}",
+        )
+
+        if file_path:
+            with open(file_path, "rb") as f:
+                await self.app.bot.send_document(
+                    chat_id=task.chat_id,
+                    document=f,
+                    filename=file_path.name,
+                )
+
     async def _handle_message(
         self,
         update: Update,
@@ -301,12 +573,19 @@ class TelegramBot:
             await file.download_to_drive(image_path)
             image_paths.append(str(image_path))
 
+        # Get last-used project for this chat
+        chat_id = message.chat_id
+        last_project = self.sessions.get_last_project(chat_id)
+
         # Parse message
         try:
-            parsed = self.router.parse(text, image_paths)
+            parsed = self.router.parse(text, image_paths, last_project=last_project)
         except ValueError as e:
             await message.reply_text(str(e))
             return
+
+        # Save this as the last-used project
+        self.sessions.set_last_project(chat_id, parsed.project_name)
 
         # Create queued task
         task = QueuedTask(
