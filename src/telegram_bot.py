@@ -20,6 +20,7 @@ from datetime import datetime
 from .approval_handler import ApprovalHandler
 from .claude_interface import ClaudeInterface, SAFE_TOOLS
 from .config import Config
+from .desktop_session_scanner import DesktopSessionScanner, DesktopSession
 from .message_router import MessageRouter, ParsedMessage
 from .output_processor import OutputProcessor
 from .queue_manager import QueuedTask, QueueManager
@@ -43,6 +44,9 @@ class TelegramBot:
         self.queue = QueueManager()
         self.approvals = ApprovalHandler()
         self.scheduler = ScheduledTaskManager(config.sessions.storage_path)
+        self.scanner = DesktopSessionScanner()
+        # Stores (all_sessions, current_offset, friendly_names) for pagination
+        self._pending_session_select: dict[int, tuple[list[DesktopSession], int, dict[str, str]]] = {}
         self.app: Application = None
 
     async def start(self) -> None:
@@ -65,6 +69,8 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("schedule", self._cmd_schedule))
         self.app.add_handler(CommandHandler("tasks", self._cmd_tasks))
         self.app.add_handler(CommandHandler("deletetask", self._cmd_deletetask))
+        self.app.add_handler(CommandHandler("sessions", self._cmd_sessions))
+        self.app.add_handler(CommandHandler("detach", self._cmd_detach))
 
         # Callback handler for approval buttons
         self.app.add_handler(CallbackQueryHandler(self.approvals.handle_callback))
@@ -147,6 +153,9 @@ class TelegramBot:
             "  /skip - Skip current errored task\n"
             "  /addproject name path - Add project\n"
             "  /removeproject name - Remove project\n\n"
+            "Desktop sessions:\n"
+            "  /sessions - List recent Claude Code desktop sessions\n"
+            "  /detach - Detach from attached session\n\n"
             "Scheduled tasks:\n"
             "  /schedule <type> <time> #project <prompt>\n"
             "  /tasks - List scheduled tasks\n"
@@ -488,6 +497,60 @@ class TelegramBot:
         else:
             await update.message.reply_text(f"Task {task_id} not found")
 
+    async def _cmd_sessions(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /sessions command - list recent Claude Code desktop sessions."""
+        if not self._is_authorized(update):
+            return
+
+        chat_id = update.message.chat_id
+        # Fetch plenty of sessions for pagination (up to 50)
+        all_sessions = self.scanner.get_recent_sessions(50)
+
+        if not all_sessions:
+            await update.message.reply_text("No recent Claude Code sessions found.")
+            return
+
+        # Build friendly_names mapping from tracked sessions
+        # tracked is {project_name: session_id}, we need {session_id: project_name}
+        tracked = self.sessions.list_sessions()
+        friendly_names = {sid: name for name, sid in tracked.items()}
+
+        # Show first 10, store all for pagination
+        page_size = 10
+        display_sessions = all_sessions[:page_size]
+        has_more = len(all_sessions) > page_size
+
+        # Store (all_sessions, current_offset, friendly_names)
+        self._pending_session_select[chat_id] = (all_sessions, 0, friendly_names)
+
+        # Format and send the list
+        message_text = self.scanner.format_session_list(
+            display_sessions, offset=0, has_more=has_more, friendly_names=friendly_names
+        )
+        await update.message.reply_text(message_text)
+
+    async def _cmd_detach(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /detach command - detach from attached desktop session."""
+        if not self._is_authorized(update):
+            return
+
+        chat_id = update.message.chat_id
+
+        if self.sessions.clear_attached_session(chat_id):
+            await update.message.reply_text(
+                "Detached. Back to normal project mode."
+            )
+        else:
+            await update.message.reply_text("Not attached to any desktop session.")
+
     async def _execute_scheduled_task(self, task: ScheduledTask) -> None:
         """Execute a scheduled task - callback for ScheduledTaskManager."""
         project_config = self.config.projects.get(task.project_name)
@@ -559,6 +622,58 @@ class TelegramBot:
             await message.reply_text("Please include a task description.")
             return
 
+        chat_id = message.chat_id
+
+        # Check if user is selecting a session (replied with just a number or 'more')
+        if chat_id in self._pending_session_select:
+            stripped = text.strip().lower()
+            all_sessions, current_offset, friendly_names = self._pending_session_select[chat_id]
+            page_size = 10
+
+            # Handle "more" to show next page
+            if stripped == "more":
+                new_offset = current_offset + page_size
+                if new_offset >= len(all_sessions):
+                    await message.reply_text("No more sessions to show.")
+                    return
+
+                display_sessions = all_sessions[new_offset : new_offset + page_size]
+                has_more = new_offset + page_size < len(all_sessions)
+
+                # Update offset
+                self._pending_session_select[chat_id] = (all_sessions, new_offset, friendly_names)
+
+                message_text = self.scanner.format_session_list(
+                    display_sessions, offset=new_offset, has_more=has_more, friendly_names=friendly_names
+                )
+                await message.reply_text(message_text)
+                return
+
+            # Handle number selection
+            if stripped.isdigit():
+                idx = int(stripped) - 1  # Convert to 0-based index
+                if 0 <= idx < len(all_sessions):
+                    selected = all_sessions[idx]
+                    self.sessions.set_attached_session(
+                        chat_id, selected.session_id, selected.project_path
+                    )
+                    del self._pending_session_select[chat_id]
+                    await message.reply_text(
+                        f"Attached to session in {selected.project_path}\n"
+                        "All messages will continue this conversation.\n"
+                        "Use /detach to return to normal mode."
+                    )
+                    return
+
+            # Clear pending if invalid input (will process as normal message)
+            del self._pending_session_select[chat_id]
+
+        # Check if attached to a desktop session
+        attached = self.sessions.get_attached_session(chat_id)
+        if attached:
+            await self._process_attached_message(message, text)
+            return
+
         # Download any photos
         image_paths = []
         if message.photo:
@@ -574,7 +689,6 @@ class TelegramBot:
             image_paths.append(str(image_path))
 
         # Get last-used project for this chat
-        chat_id = message.chat_id
         last_project = self.sessions.get_last_project(chat_id)
 
         # Parse message
@@ -694,6 +808,65 @@ class TelegramBot:
             with open(file_path, "rb") as f:
                 await self.app.bot.send_document(
                     chat_id=task.chat_id,
+                    document=f,
+                    filename=file_path.name,
+                )
+
+    async def _process_attached_message(self, message, text: str) -> None:
+        """Process a message for an attached desktop session."""
+        chat_id = message.chat_id
+        attached = self.sessions.get_attached_session(chat_id)
+
+        if not attached:
+            # Should not happen, but handle gracefully
+            await message.reply_text("Not attached to any session.")
+            return
+
+        session_id = attached["session_id"]
+        project_path = attached["project_path"]
+
+        # Send processing indicator
+        await message.reply_text(f"[Attached: {project_path}]\nProcessing...")
+
+        # Execute with --resume pointing to the desktop session
+        result = await self.claude.execute(
+            prompt=text,
+            working_dir=project_path,
+            session_id=session_id,
+            approval_mode="safe",  # Use safe mode for attached sessions
+            allowed_tools=None,
+        )
+
+        # Check if session was not found (file deleted, etc.)
+        if result.error and "session" in result.error.lower():
+            self.sessions.clear_attached_session(chat_id)
+            await message.reply_text(
+                f"Session not found. Detached from {project_path}.\n"
+                "Use /sessions to select a new session."
+            )
+            return
+
+        # Process and send output
+        # Use a generic name since this is a desktop session
+        display_name = Path(project_path).name
+        message_text, file_path = self.output.process(
+            output=result.output,
+            project_name=display_name,
+            success=result.success,
+            error=result.error,
+        )
+
+        # Send result
+        await self.app.bot.send_message(
+            chat_id=chat_id,
+            text=message_text,
+        )
+
+        # Send file if created
+        if file_path:
+            with open(file_path, "rb") as f:
+                await self.app.bot.send_document(
+                    chat_id=chat_id,
                     document=f,
                     filename=file_path.name,
                 )

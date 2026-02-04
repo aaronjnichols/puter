@@ -90,3 +90,74 @@ class SessionManager:
         data["last_project"] = project_name
         with open(prefs_file, "w", encoding="utf-8") as f:
             json.dump(data, f)
+
+    def get_attached_session(self, chat_id: int) -> Optional[dict]:
+        """Get attached desktop session for a chat.
+
+        Returns:
+            Dict with session_id and project_path, or None if not attached.
+        """
+        prefs_file = self._chat_prefs_file(chat_id)
+        if not prefs_file.exists():
+            return None
+        try:
+            with open(prefs_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("attached_session")
+        except (json.JSONDecodeError, IOError):
+            return None
+
+    def set_attached_session(
+        self, chat_id: int, session_id: str, project_path: str
+    ) -> None:
+        """Attach a desktop session to a chat.
+
+        Args:
+            chat_id: Telegram chat ID.
+            session_id: Claude Code session UUID.
+            project_path: Working directory for the session.
+        """
+        prefs_file = self._chat_prefs_file(chat_id)
+
+        # Load existing prefs or start fresh
+        data = {}
+        if prefs_file.exists():
+            try:
+                with open(prefs_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        data["attached_session"] = {
+            "session_id": session_id,
+            "project_path": project_path,
+        }
+        with open(prefs_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def clear_attached_session(self, chat_id: int) -> bool:
+        """Detach from desktop session.
+
+        Args:
+            chat_id: Telegram chat ID.
+
+        Returns:
+            True if was attached, False otherwise.
+        """
+        prefs_file = self._chat_prefs_file(chat_id)
+        if not prefs_file.exists():
+            return False
+
+        try:
+            with open(prefs_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return False
+
+        if "attached_session" not in data:
+            return False
+
+        del data["attached_session"]
+        with open(prefs_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        return True
