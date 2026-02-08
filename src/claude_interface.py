@@ -50,7 +50,7 @@ class ClaudeInterface:
     def __init__(
         self,
         executable: str = "claude",
-        timeout: int = 300,
+        timeout: int = 1800,
     ):
         self.executable = executable
         self.timeout = timeout
